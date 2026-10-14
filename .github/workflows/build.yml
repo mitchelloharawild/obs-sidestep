@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux plugin + tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OBS Studio (obsproject PPA)
+        run: |
+          sudo add-apt-repository -y ppa:obsproject/obs-studio
+          sudo apt-get update
+          # The PPA's obs-studio package ships the libobs headers and CMake
+          # package; libobs's CMake config also needs SIMDe headers.
+          sudo apt-get install -y --no-install-recommends \
+            obs-studio libsimde-dev cmake ninja-build
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Check module symbols resolve
+        run: |
+          ldd build/obs-sidestep.so
+          ! ldd build/obs-sidestep.so | grep -q "not found"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obs-sidestep-linux-x86_64
+          path: |
+            build/obs-sidestep.so
+            data/
+
+  core:
+    name: Core tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DSIDESTEP_BUILD_PLUGIN=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
