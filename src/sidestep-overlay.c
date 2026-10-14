@@ -1,6 +1,7 @@
 /*
- * obs-sidestep — debug overlay: busy mask tint, candidate outlines and a
- * tiny built-in 3x5 bitmap font for score labels / status text.
+ * obs-sidestep — debug overlay: cost map tint (red, stronger = costlier),
+ * detected background images (blue), candidate outlines and a tiny
+ * built-in 3x5 bitmap font for score labels / status text.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -15,7 +16,8 @@
 struct sidestep_overlay {
 	pthread_mutex_t mutex;
 
-	/* mask as RGBA (red, alpha = tint), rebuilt by set_mask */
+	/* maps as RGBA (red cost / blue image, alpha = tint), rebuilt by
+	 * set_maps */
 	uint8_t *mask_rgba;
 	uint32_t mask_w, mask_h;
 	bool mask_dirty;
@@ -54,10 +56,12 @@ void sidestep_overlay_destroy(struct sidestep_overlay *o)
 }
 
 #define MASK_ALPHA 110
+#define IMAGE_ALPHA 80
 
-void sidestep_overlay_set_mask(struct sidestep_overlay *o, const uint8_t *mask, uint32_t w, uint32_t h)
+void sidestep_overlay_set_maps(struct sidestep_overlay *o, const uint8_t *cost, const uint8_t *image, uint32_t w,
+			       uint32_t h)
 {
-	if (!o || !mask || !w || !h)
+	if (!o || !cost || !w || !h)
 		return;
 
 	pthread_mutex_lock(&o->mutex);
@@ -69,10 +73,17 @@ void sidestep_overlay_set_mask(struct sidestep_overlay *o, const uint8_t *mask, 
 	}
 	uint8_t *p = o->mask_rgba;
 	for (size_t i = 0, n = (size_t)w * h; i < n; i++, p += 4) {
-		p[0] = 255;
-		p[1] = 0;
-		p[2] = 0;
-		p[3] = mask[i] ? MASK_ALPHA : 0;
+		if (cost[i] || !image || !image[i]) {
+			p[0] = 255;
+			p[1] = 0;
+			p[2] = 0;
+			p[3] = (uint8_t)((cost[i] * MASK_ALPHA + 127) / 255);
+		} else {
+			p[0] = 40;
+			p[1] = 120;
+			p[2] = 255;
+			p[3] = IMAGE_ALPHA;
+		}
 	}
 	o->mask_dirty = true;
 	o->has_mask = true;
@@ -162,9 +173,9 @@ static const struct glyph font[] = {
 	{'0', {7, 5, 5, 5, 7}}, {'1', {2, 6, 2, 2, 7}}, {'2', {7, 1, 7, 4, 7}}, {'3', {7, 1, 7, 1, 7}},
 	{'4', {5, 5, 7, 1, 1}}, {'5', {7, 4, 7, 1, 7}}, {'6', {7, 4, 7, 5, 7}}, {'7', {7, 1, 1, 1, 1}},
 	{'8', {7, 5, 7, 5, 7}}, {'9', {7, 5, 7, 1, 7}}, {'.', {0, 0, 0, 0, 2}}, {'%', {5, 1, 2, 4, 5}},
-	{'A', {2, 5, 7, 5, 5}}, {'D', {6, 5, 5, 5, 6}}, {'E', {7, 4, 6, 4, 7}}, {'L', {4, 4, 4, 4, 7}},
-	{'N', {6, 5, 5, 5, 5}}, {'P', {6, 5, 6, 4, 4}}, {'S', {3, 4, 2, 1, 6}}, {'T', {7, 2, 2, 2, 2}},
-	{'U', {5, 5, 5, 5, 7}},
+	{'A', {2, 5, 7, 5, 5}}, {'D', {6, 5, 5, 5, 6}}, {'E', {7, 4, 6, 4, 7}}, {'G', {7, 4, 5, 5, 7}},
+	{'I', {7, 2, 2, 2, 7}}, {'L', {4, 4, 4, 4, 7}}, {'M', {5, 7, 7, 5, 5}}, {'N', {6, 5, 5, 5, 5}},
+	{'P', {6, 5, 6, 4, 4}}, {'S', {3, 4, 2, 1, 6}}, {'T', {7, 2, 2, 2, 2}}, {'U', {5, 5, 5, 5, 7}},
 };
 
 static const uint8_t *find_glyph(char ch)
@@ -283,7 +294,7 @@ void sidestep_overlay_render(struct sidestep_overlay *o, uint32_t cx, uint32_t c
 			}
 			outline_rect(&d, r->x, r->y, r->w, r->h, t, col);
 
-			snprintf(label, sizeof(label), "%.1f%%", (double)r->score * 100.0);
+			snprintf(label, sizeof(label), "%.1f%%%s", (double)r->score * 100.0, r->on_image ? " IMG" : "");
 			draw_text(&d, r->x + 2.0f * t, r->y + 2.0f * t, px, label, col);
 		}
 

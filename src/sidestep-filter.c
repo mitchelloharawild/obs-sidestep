@@ -25,6 +25,7 @@
 
 #include "busy.h"
 #include "place.h"
+#include "strategy.h"
 #include "sidestep-capture.h"
 #include "sidestep-overlay.h"
 
@@ -46,15 +47,18 @@
 #define S_FALLBACK "fallback"
 #define S_HELP_TRANSITION "help_transition"
 #define S_GROUP_DETECTION "group_detection"
+#define S_STRATEGY "strategy"
 #define S_INTERVAL "interval"
 #define S_SENSITIVITY "sensitivity"
 #define S_USE_MOTION "use_motion"
+#define S_IGNORE_TEMPLATE "ignore_template"
 #define S_DEBUG "debug_overlay"
 #define S_GROUP_ADVANCED "group_advanced"
 #define S_CONFIRM "confirm_checks"
 #define S_RETURN_DELAY "return_delay"
 #define S_ANIM_MS "animation_ms"
 #define S_ANALYSIS_RES "analysis_res"
+#define S_IMAGE_COVERAGE "image_coverage"
 #define S_RESTORE "restore_when_disabled"
 
 #define T_(s) obs_module_text(s)
@@ -149,6 +153,7 @@ struct sidestep_filter {
 	uint64_t await_since;
 	uint64_t next_check_ns;
 	uint64_t unsettled_since; /* 0 = settled */
+	bool new_content;         /* next settled decision follows a change */
 	struct anim anim;
 	bool was_enabled;
 	bool paused;
@@ -457,11 +462,12 @@ static double rounded_area(double x0, double y0, double x1, double y1)
 	return (ceil(x1) - floor(x0)) * (ceil(y1) - floor(y0));
 }
 
-/* place_score_fn: busy fraction of a canvas rect. Canvas outside the
- * visible content counts as empty. */
-static double score_rect(void *param, double x, double y, double w, double h)
+typedef double (*analysis_rect_fn)(const struct busy_analyzer *b, double x, double y, double w, double h);
+
+/* Mean of an analysis-space rect measure over a canvas rect. Canvas
+ * outside the visible content counts as 0 (empty / not image). */
+static double mapped_rect(const struct score_ctx *s, analysis_rect_fn fn, double x, double y, double w, double h)
 {
-	const struct score_ctx *s = param;
 	double full[4], vis[4];
 
 	if (w <= 0.0 || h <= 0.0)
@@ -477,9 +483,21 @@ static double score_rect(void *param, double x, double y, double w, double h)
 
 	const double vx0 = vis[0] * s->ax, vy0 = vis[1] * s->ay;
 	const double vx1 = vis[2] * s->ax, vy1 = vis[3] * s->ay;
-	const double sc = busy_rect_score(s->busy, vx0, vy0, vx1 - vx0, vy1 - vy0);
+	const double sc = fn(s->busy, vx0, vy0, vx1 - vx0, vy1 - vy0);
 	const double v = sc * rounded_area(vx0, vy0, vx1, vy1) / a_full;
 	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
+
+/* place_score_fn: busy fraction of a canvas rect. */
+static double score_rect(void *param, double x, double y, double w, double h)
+{
+	return mapped_rect(param, busy_rect_score, x, y, w, h);
+}
+
+/* place_score_fn: background-image fraction of a canvas rect. */
+static double image_rect(void *param, double x, double y, double w, double h)
+{
+	return mapped_rect(param, busy_rect_image_frac, x, y, w, h);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -554,6 +572,7 @@ static void reset_runtime(struct sidestep_filter *f)
 	f->want_capture = false;
 	f->next_check_ns = 0;
 	f->unsettled_since = 0;
+	f->new_content = true;
 	sidestep_overlay_clear(f->overlay);
 }
 
@@ -598,20 +617,22 @@ static void push_report(struct sidestep_filter *f, const struct content_map *map
 		rects[n].h = (float)(r[3] - r[1]);
 		rects[n].score = (float)it->score;
 		rects[n].suitable = it->suitable;
+		rects[n].on_image = it->on_image;
 		rects[n].chosen = (i == d->chosen);
 		n++;
 	}
 	sidestep_overlay_set_rects(f->overlay, rects, n);
 }
 
-static void decide(struct sidestep_filter *f, struct targets *t, uint64_t now)
+/* Returns false if no decision could be made (nothing evaluated). */
+static bool decide(struct sidestep_filter *f, struct targets *t, uint64_t now, bool new_content)
 {
 	obs_source_t *parent = obs_filter_get_parent(f->context);
 	obs_source_t *target = obs_filter_get_target(f->context);
 	struct content_map map;
 
 	if (!parent || !target || !content_map_build(&map, t->content, parent, target))
-		return;
+		return false;
 
 	struct score_ctx sc = {
 		.map = &map,
@@ -630,9 +651,11 @@ static void decide(struct sidestep_filter *f, struct targets *t, uint64_t now)
 	in.cam_visible = obs_sceneitem_visible(t->cam);
 	in.score = score_rect;
 	in.score_ctx = &sc;
+	in.image_frac = image_rect;
+	in.new_content = new_content;
 
 	if (in.cam_w < 1.0 || in.cam_h < 1.0)
-		return;
+		return false;
 
 	struct place_decision d = place_evaluate(&f->pstate, &f->pcfg, &in);
 
@@ -654,6 +677,7 @@ static void decide(struct sidestep_filter *f, struct targets *t, uint64_t now)
 
 	if (f->debug)
 		push_report(f, &map, &d);
+	return true;
 }
 
 /* A captured frame arrived: analyse, apply the transition guard, decide. */
@@ -669,16 +693,22 @@ static void process_frame(struct sidestep_filter *f, struct targets *t, uint32_t
 	if (!f->busy)
 		return;
 
+	f->bparams.now_ns = ts;
 	busy_process(f->busy, f->frame, w * 4, BUSY_FMT_RGBA, &f->bparams);
 
 	if (f->debug)
-		sidestep_overlay_set_mask(f->overlay, f->busy->mask, w, h);
+		sidestep_overlay_set_maps(f->overlay, f->busy->cost, f->busy->has_image ? f->busy->image : NULL, w,
+					  h);
 
 	const uint64_t recheck = f->interval_ns < SETTLE_RECHECK_NS ? f->interval_ns : SETTLE_RECHECK_NS;
 
+	bool new_content = false;
 	if (f->busy->global_change > UNSETTLED_G) {
 		/* Mid-transition: recheck soon instead of deciding, but never
-		 * stay undecided for longer than one regular interval. */
+		 * stay undecided for longer than one regular interval. The
+		 * first settled decision afterwards sees new content (a
+		 * forced decision mid-animation doesn't). */
+		f->new_content = true;
 		if (!f->unsettled_since)
 			f->unsettled_since = ts;
 		f->next_check_ns = now + recheck;
@@ -690,13 +720,16 @@ static void process_frame(struct sidestep_filter *f, struct targets *t, uint32_t
 		sidestep_overlay_set_status(f->overlay, true, false);
 	} else {
 		f->unsettled_since = 0;
+		new_content = f->new_content;
+		f->new_content = false;
 		f->next_check_ns = ts + f->interval_ns;
 		if (f->next_check_ns < now)
 			f->next_check_ns = now;
 		sidestep_overlay_set_status(f->overlay, false, false);
 	}
 
-	decide(f, t, now);
+	if (!decide(f, t, now, new_content) && new_content)
+		f->new_content = true; /* keep it for the next decision */
 }
 
 static void handle_hotkeys(struct sidestep_filter *f, obs_sceneitem_t *cam)
@@ -870,8 +903,17 @@ static void sidestep_update(void *data, obs_data_t *settings)
 		c->confirm_checks = 5;
 	c->return_delay_ns = (uint64_t)(fmax(obs_data_get_double(settings, S_RETURN_DELAY), 0.0) * NS_PER_SEC);
 
+	/* Unknown ids (e.g. from a newer version) act as "Any content". */
+	const struct busy_strategy_ops *strat = busy_strategy_find((int)obs_data_get_int(settings, S_STRATEGY));
+	c->prefer_images = strat->prefers_images;
+	c->t_image = fmin(fmax((double)obs_data_get_int(settings, S_IMAGE_COVERAGE), 1.0), 100.0) / 100.0;
+
 	busy_params_default(&f->bparams);
 	f->bparams.use_motion = obs_data_get_bool(settings, S_USE_MOTION);
+	f->bparams.strategy = strat->id;
+	f->bparams.ignore_template = obs_data_get_bool(settings, S_IGNORE_TEMPLATE);
+	if (f->busy)
+		busy_set_strategy(f->busy, strat->id); /* fresh state on change */
 
 	double interval = obs_data_get_double(settings, S_INTERVAL);
 	if (interval < 0.1)
@@ -893,6 +935,7 @@ static void sidestep_update(void *data, obs_data_t *settings)
 	place_state_reset(&f->pstate);
 	f->next_check_ns = 0;
 	f->unsettled_since = 0;
+	f->new_content = true;
 
 	pthread_mutex_unlock(&f->lock);
 }
@@ -915,14 +958,17 @@ static void sidestep_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_MARGIN, 24);
 	obs_data_set_default_bool(settings, S_RETURN_HOME, true);
 	obs_data_set_default_int(settings, S_FALLBACK, PLACE_FALLBACK_HIDE);
+	obs_data_set_default_int(settings, S_STRATEGY, BUSY_STRATEGY_ANY);
 	obs_data_set_default_double(settings, S_INTERVAL, 1.0);
 	obs_data_set_default_int(settings, S_SENSITIVITY, 50);
 	obs_data_set_default_bool(settings, S_USE_MOTION, true);
+	obs_data_set_default_bool(settings, S_IGNORE_TEMPLATE, false);
 	obs_data_set_default_bool(settings, S_DEBUG, false);
 	obs_data_set_default_int(settings, S_CONFIRM, 1);
 	obs_data_set_default_double(settings, S_RETURN_DELAY, 3.0);
 	obs_data_set_default_int(settings, S_ANIM_MS, 300);
 	obs_data_set_default_int(settings, S_ANALYSIS_RES, 320);
+	obs_data_set_default_int(settings, S_IMAGE_COVERAGE, 90);
 	obs_data_set_default_bool(settings, S_RESTORE, true);
 }
 
@@ -1025,6 +1071,15 @@ static bool mode_modified(obs_properties_t *props, obs_property_t *p, obs_data_t
 	}
 	obs_property_set_visible(obs_properties_get(root, S_CAPTURE_POS), choices);
 	obs_property_set_visible(obs_properties_get(root, S_RETURN_HOME), choices);
+	return true;
+}
+
+/* Show the selected strategy's description and its relevant options. */
+static bool strategy_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	const struct busy_strategy_ops *s = busy_strategy_find((int)obs_data_get_int(settings, S_STRATEGY));
+	obs_property_set_long_description(p, T_(s->desc_key));
+	obs_property_set_visible(obs_properties_get(props_root(props), S_IMAGE_COVERAGE), s->prefers_images);
 	return true;
 }
 
@@ -1172,11 +1227,19 @@ static obs_properties_t *sidestep_properties(void *data)
 
 	/* Detection */
 	obs_properties_t *det = obs_properties_create();
+	p = obs_properties_add_list(det, S_STRATEGY, T_("Strategy"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	for (size_t i = 0; i < busy_strategy_count(); i++) {
+		const struct busy_strategy_ops *s = busy_strategy_get(i);
+		obs_property_list_add_int(p, T_(s->name_key), s->id);
+	}
+	obs_property_set_modified_callback(p, strategy_modified);
 	p = obs_properties_add_float_slider(det, S_INTERVAL, T_("Interval"), 0.1, 10.0, 0.1);
 	obs_property_float_set_suffix(p, " s");
 	p = obs_properties_add_int_slider(det, S_SENSITIVITY, T_("Sensitivity"), 0, 100, 1);
 	obs_property_set_long_description(p, T_("Sensitivity.Description"));
 	obs_properties_add_bool(det, S_USE_MOTION, T_("UseMotion"));
+	p = obs_properties_add_bool(det, S_IGNORE_TEMPLATE, T_("IgnoreTemplate"));
+	obs_property_set_long_description(p, T_("IgnoreTemplate.Description"));
 	p = obs_properties_add_bool(det, S_DEBUG, T_("DebugOverlay"));
 	obs_property_set_long_description(p, T_("DebugOverlay.Description"));
 	obs_properties_add_group(props, S_GROUP_DETECTION, T_("Group.Detection"), OBS_GROUP_NORMAL, det);
@@ -1194,6 +1257,9 @@ static obs_properties_t *sidestep_properties(void *data)
 	obs_property_list_add_int(p, "160×90", 160);
 	obs_property_list_add_int(p, "320×180", 320);
 	obs_property_list_add_int(p, "480×270", 480);
+	p = obs_properties_add_int_slider(adv, S_IMAGE_COVERAGE, T_("ImageCoverage"), 50, 100, 1);
+	obs_property_int_set_suffix(p, " %");
+	obs_property_set_long_description(p, T_("ImageCoverage.Description"));
 	obs_properties_add_bool(adv, S_RESTORE, T_("RestoreWhenDisabled"));
 	obs_properties_add_group(props, S_GROUP_ADVANCED, T_("Group.Advanced"), OBS_GROUP_NORMAL, adv);
 

@@ -1,7 +1,8 @@
 /*
  * obs-sidestep — debug overlay (private).
  *
- * Holds a copy of the busy mask and the last check's candidate rects, and
+ * Holds a copy of the cost / image maps and the last check's candidate
+ * rects, and
  * draws them over the filter output. Setters may be called from any
  * thread; render only from the graphics thread.
  *
@@ -18,6 +19,7 @@ struct sidestep_overlay_rect {
 	float x, y, w, h;
 	float score; /* busy fraction [0, 1] */
 	bool suitable;
+	bool on_image; /* image-suitable (image-preferring strategies) */
 	bool chosen;
 };
 
@@ -27,8 +29,10 @@ struct sidestep_overlay *sidestep_overlay_create(void);
 /* Frees GPU objects (enters the graphics context itself). */
 void sidestep_overlay_destroy(struct sidestep_overlay *o);
 
-/* Copy a w x h 0/1 mask (analysis resolution). */
-void sidestep_overlay_set_mask(struct sidestep_overlay *o, const uint8_t *mask, uint32_t w, uint32_t h);
+/* Copy a w x h 0..255 cost map and optional 0/1 image map (NULL = none),
+ * both at analysis resolution. */
+void sidestep_overlay_set_maps(struct sidestep_overlay *o, const uint8_t *cost, const uint8_t *image, uint32_t w,
+			       uint32_t h);
 void sidestep_overlay_set_rects(struct sidestep_overlay *o, const struct sidestep_overlay_rect *rects, int n);
 void sidestep_overlay_set_status(struct sidestep_overlay *o, bool unsettled, bool paused);
 void sidestep_overlay_clear(struct sidestep_overlay *o);
