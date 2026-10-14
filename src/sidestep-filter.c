@@ -258,6 +258,17 @@ static enum sidestep_status resolve_targets(struct sidestep_filter *f, struct ta
 	if (src) {
 		t->scene_src = src;
 		t->scene = obs_scene_from_source(src);
+
+		/* Keep the stored name in sync so a renamed scene is still
+		 * found after a reload. */
+		const char *name = obs_source_get_name(src);
+		if (name && strcmp(name, f->scene_name) != 0) {
+			obs_data_t *settings = obs_source_get_settings(f->context);
+			bfree(f->scene_name);
+			f->scene_name = bstrdup(name);
+			obs_data_set_string(settings, S_SCENE, name);
+			obs_data_release(settings);
+		}
 	} else {
 		if (!resolve_scene_by_name(f->scene_name, t))
 			return ST_SCENE_MISSING;
