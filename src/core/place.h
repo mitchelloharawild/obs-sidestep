@@ -3,7 +3,9 @@
  *
  * Candidate generation (anchors, captured position, automatic grid search),
  * selection, and the hysteresis state machine (confirm checks, cooldown,
- * return home, hide/show).
+ * return home, hide/show), plus optional image preference: with a strategy
+ * that detects background images, positions on an image are ranked first
+ * whenever the content changes.
  *
  * All geometry is in canvas pixels. A "position" is the top-left corner of
  * the camera's bounding box. Time is in nanoseconds (os_gettime_ns()).
@@ -63,6 +65,12 @@ struct place_config {
 	uint64_t cooldown_ns;     /* default 1 s, min time between actions */
 	double lambda;            /* default 0.01, distance penalty in auto search */
 	int grid_divisions;       /* default 48: auto-search stride = canvas_w / 48 */
+
+	/* Image preference (strategies with prefers_images). A position is
+	 * image-suitable if it is suitable AND image_frac(camera rect, not
+	 * inflated) >= t_image. */
+	bool prefer_images; /* default false */
+	double t_image;     /* default 0.9 */
 };
 
 void place_config_default(struct place_config *c);
@@ -80,6 +88,17 @@ struct place_input {
 	bool cam_visible;    /* camera's current visibility */
 	place_score_fn score;
 	void *score_ctx;
+
+	/* Optional: fraction [0, 1] of a canvas rect covered by a detected
+	 * background image (NULL = no image information). Called with
+	 * image_ctx, or score_ctx when image_ctx is NULL. */
+	place_score_fn image_frac;
+	void *image_ctx;
+
+	/* The content changed substantially since the last decision (first
+	 * check, first settled check after a transition, after a reset).
+	 * With prefer_images this triggers an image re-rank. */
+	bool new_content;
 };
 
 enum place_action {
@@ -97,6 +116,8 @@ struct place_report_item {
 	double x, y, w, h;
 	double score;
 	bool suitable;
+	double image_frac; /* 0 without image information */
+	bool on_image;     /* image-suitable (prefer_images only) */
 };
 
 struct place_decision {
@@ -114,8 +135,13 @@ struct place_state {
 	/* Per-priority time since which choices[i] has been continuously
 	 * suitable (0 = not currently suitable). */
 	uint64_t suitable_since_ns[PLACE_MAX_CHOICES];
+	/* Same, for image-suitable (prefer_images only). */
+	uint64_t image_since_ns[PLACE_MAX_CHOICES];
 	uint64_t last_action_ns;
 	bool has_acted;
+	/* Image re-rank requested by new_content, not yet acted on (e.g.
+	 * blocked by the cooldown). Superseded by the next new_content. */
+	bool rerank_pending;
 };
 
 void place_state_reset(struct place_state *s);
@@ -144,6 +170,16 @@ bool place_anchor_pos(enum place_anchor a, const struct place_config *c,
  *  - While hidden: SHOW at the selected position once something is
  *    suitable for confirm_checks consecutive checks.
  *  - Cooldown: no MOVE/HIDE/SHOW within cooldown_ns of the previous one.
+ * With prefer_images (and in->image_frac):
+ *  - new_content requests a re-rank: move (or show) to the highest-priority
+ *    image-suitable choice (ANYWHERE: the best image-suitable grid rect),
+ *    unless the camera already sits on an image-suitable position of equal
+ *    or higher priority. No confirm checks; the request stays pending
+ *    through the cooldown and is dropped if there's no image-suitable spot.
+ *  - Selections (moves, shows, auto search) rank image-suitable positions
+ *    before merely suitable ones.
+ *  - While on an image-suitable position, return home only goes to
+ *    higher-priority choices that are image-suitable themselves.
  * Positions are clamped so the camera stays within the margins.
  */
 struct place_decision place_evaluate(struct place_state *s,

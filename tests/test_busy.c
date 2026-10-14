@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "busy.h"
+#include "strategy.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -126,6 +127,7 @@ static void test_params_and_create(void)
 	CHECK(p.t_edge == 24);
 	CHECK(p.t_motion == 24);
 	CHECK(p.use_motion == true);
+	CHECK(p.strategy == BUSY_STRATEGY_ANY);
 
 	CHECK(busy_create(0, 10) == NULL);
 	CHECK(busy_create(10, 0) == NULL);
@@ -261,7 +263,7 @@ static void test_noise_photo(void)
 		uint32_t sum = 0;
 		for (uint32_t y = y0; y < y0 + rh; y++)
 			for (uint32_t x = x0; x < x0 + rw; x++)
-				sum += b->mask[(size_t)y * im.w + x];
+				sum += b->cost[(size_t)y * im.w + x] / 255;
 		double want = (double)sum / ((double)rw * rh);
 		if (fabs(busy_rect_score(b, x0, y0, rw, rh) - want) > 1e-12)
 			bad++;
@@ -370,8 +372,8 @@ static void test_outside_rects(void)
 	struct busy_analyzer *b = busy_create(im.w, im.h);
 	struct busy_params p = defaults();
 	busy_process(b, im.px, im.linesize, BUSY_FMT_RGBA, &p);
-	CHECK(b->mask[0] == 1);
-	CHECK(b->mask[(size_t)im.w * im.h - 1] == 0);
+	CHECK(b->cost[0] == 255);
+	CHECK(b->cost[(size_t)im.w * im.h - 1] == 0);
 
 	CHECK(busy_rect_score(b, 0, 0, 10, 10) == 1.0);
 	/* Partially outside: 10x10 inside of a 20x20 rect. */
@@ -417,7 +419,7 @@ static void test_bgra_equivalence(void)
 	busy_process(a, rgba.px, rgba.linesize, BUSY_FMT_RGBA, &p);
 	busy_process(c, bgra.px, bgra.linesize, BUSY_FMT_BGRA, &p);
 	CHECK(memcmp(a->luma, c->luma, (size_t)w * h) == 0);
-	CHECK(memcmp(a->mask, c->mask, (size_t)w * h) == 0);
+	CHECK(memcmp(a->cost, c->cost, (size_t)w * h) == 0);
 
 	/* Luma formula spot checks. */
 	CHECK(a->luma[0] ==
@@ -461,7 +463,7 @@ static void test_linesize_padding(void)
 	busy_process(a, tight.px, tight.linesize, BUSY_FMT_RGBA, &p);
 	busy_process(c, padded.px, padded.linesize, BUSY_FMT_RGBA, &p);
 	CHECK(memcmp(a->luma, c->luma, (size_t)w * h) == 0);
-	CHECK(memcmp(a->mask, c->mask, (size_t)w * h) == 0);
+	CHECK(memcmp(a->cost, c->cost, (size_t)w * h) == 0);
 	CHECK(busy_rect_score(c, 30, 0, 20, 30) == 0.0);
 	CHECK(busy_rect_score(c, 0, 0, 25, 25) > 0.1);
 
@@ -482,6 +484,245 @@ static void test_sensitivity(void)
 	      busy_sensitivity_to_threshold(10));
 }
 
+/* ------------------------------------------------------------------------ */
+/* Strategies                                                                */
+
+static void test_registry(void)
+{
+	size_t n = busy_strategy_count();
+	CHECK(n >= 2);
+	CHECK(busy_strategy_get(0) == &busy_strat_any);
+	CHECK(busy_strategy_get(n) == NULL);
+	CHECK(busy_strategy_find(BUSY_STRATEGY_ANY) == &busy_strat_any);
+	CHECK(busy_strategy_find(BUSY_STRATEGY_BG_IMAGE) == &busy_strat_bgimage);
+	CHECK(busy_strategy_find(-1) == &busy_strat_any);
+	CHECK(busy_strategy_find(9999) == &busy_strat_any);
+	for (size_t i = 0; i < n; i++) {
+		const struct busy_strategy_ops *s = busy_strategy_get(i);
+		CHECK(s && s->process && s->name_key && s->desc_key);
+		for (size_t j = 0; j < i; j++)
+			CHECK(busy_strategy_get(j)->id != s->id);
+	}
+	CHECK(!busy_strat_any.prefers_images);
+	CHECK(busy_strat_bgimage.prefers_images);
+	CHECK(busy_modifier_get(busy_modifier_count()) == NULL);
+}
+
+static void test_cost_map(void)
+{
+	struct image im = img_new(320, 180, 320 * 4);
+	img_fill(&im, 0, 0, im.w, im.h, 250);
+	img_text(&im, 8, 8, 140, 70, 20);
+	struct busy_analyzer *b = busy_create(im.w, im.h);
+	struct busy_params p = defaults();
+	busy_process(b, im.px, im.linesize, BUSY_FMT_RGBA, &p);
+
+	/* ANY: cost is exactly 0 or 255, matching the edge rule. */
+	bool binary = true, agrees = true;
+	for (size_t i = 0, n = (size_t)im.w * im.h; i < n; i++) {
+		binary = binary && (b->cost[i] == 0 || b->cost[i] == 255);
+		agrees = agrees && (b->cost[i] == 255) == (b->edge[i] > p.t_edge);
+	}
+	CHECK(binary);
+	CHECK(agrees);
+	CHECK(b->strategy == &busy_strat_any);
+	CHECK(!b->has_image);
+	CHECK(busy_rect_image_frac(b, 0, 0, im.w, im.h) == 0.0);
+
+	/* Unknown ids fall back to ANY with identical results. */
+	struct busy_analyzer *c = busy_create(im.w, im.h);
+	struct busy_params q = p;
+	q.strategy = 4242;
+	busy_process(c, im.px, im.linesize, BUSY_FMT_RGBA, &q);
+	CHECK(c->strategy == &busy_strat_any);
+	CHECK(memcmp(b->cost, c->cost, (size_t)im.w * im.h) == 0);
+	CHECK(busy_rect_score(b, 0, 0, 160, 90) ==
+	      busy_rect_score(c, 0, 0, 160, 90));
+
+	/* Switching strategy, explicitly and through params. */
+	CHECK(busy_set_strategy(c, BUSY_STRATEGY_BG_IMAGE));
+	CHECK(c->strategy == &busy_strat_bgimage);
+	CHECK(c->strategy_state != NULL);
+	busy_reset_history(c);
+	CHECK(c->strategy == &busy_strat_bgimage);
+	busy_process(c, im.px, im.linesize, BUSY_FMT_RGBA, &q);
+	CHECK(c->strategy == &busy_strat_any); /* q.strategy wins */
+	CHECK(c->strategy_state == NULL);
+
+	busy_destroy(b);
+	busy_destroy(c);
+	img_free(&im);
+}
+
+/* Continuous-tone "photo": smooth colour ramps plus fine noise, so almost
+ * no pixel is exactly flat (like a downscaled photograph). */
+static void img_photo(struct image *im, uint32_t x0, uint32_t y0, uint32_t x1,
+		      uint32_t y1)
+{
+	for (uint32_t y = y0; y < y1; y++)
+		for (uint32_t x = x0; x < x1; x++) {
+			int v = 60 + (int)((x * 3 + y * 2) % 120) +
+				(int)(rng() % 48);
+			img_set(im, x, y, (uint8_t)v, (uint8_t)(v / 2 + 40),
+				(uint8_t)(200 - v / 2));
+		}
+}
+
+static void img_fill_rgb(struct image *im, uint32_t x0, uint32_t y0,
+			 uint32_t x1, uint32_t y1, uint8_t r, uint8_t g,
+			 uint8_t b)
+{
+	for (uint32_t y = y0; y < y1 && y < im->h; y++)
+		for (uint32_t x = x0; x < x1 && x < im->w; x++)
+			img_set(im, x, y, r, g, b);
+}
+
+static struct busy_params bgimage_params(void)
+{
+	struct busy_params p = defaults();
+	p.strategy = BUSY_STRATEGY_BG_IMAGE;
+	return p;
+}
+
+static void test_bgimage_side_photo(void)
+{
+	/* Letterbox slide: photo filling the right half, text on the left. */
+	struct image im = img_new(320, 180, 320 * 4);
+	img_fill(&im, 0, 0, im.w, im.h, 255);
+	img_text(&im, 10, 10, 140, 80, 30);
+	img_photo(&im, 160, 0, 320, 180);
+
+	struct busy_analyzer *b = busy_create(im.w, im.h);
+	struct busy_params p = bgimage_params();
+	busy_process(b, im.px, im.linesize, BUSY_FMT_RGBA, &p);
+	busy_process(b, im.px, im.linesize, BUSY_FMT_RGBA, &p);
+
+	CHECK(b->strategy == &busy_strat_bgimage);
+	CHECK(b->has_image);
+	/* Camera-sized rect in the photo's bottom-right corner: free, image. */
+	CHECK(busy_rect_score(b, 250, 130, 64, 36) == 0.0);
+	CHECK(busy_rect_image_frac(b, 250, 130, 64, 36) == 1.0);
+	CHECK(busy_rect_image_frac(b, 160, 0, 160, 180) > 0.95);
+	/* Text column: busy, not image; its bottom-left corner stays clear. */
+	CHECK(busy_rect_score(b, 10, 10, 130, 70) > 0.1);
+	CHECK(busy_rect_image_frac(b, 0, 0, 150, 180) < 0.05);
+	CHECK(busy_rect_score(b, 4, 130, 64, 36) == 0.0);
+	/* Outside the frame counts as not image. */
+	CHECK_NEAR(busy_rect_image_frac(b, 288, 0, 64, 36), 0.5, 1e-12);
+
+	/* The same frame under ANY: the photo is all content. */
+	struct busy_analyzer *a = busy_create(im.w, im.h);
+	struct busy_params q = defaults();
+	busy_process(a, im.px, im.linesize, BUSY_FMT_RGBA, &q);
+	CHECK(busy_rect_score(a, 250, 130, 64, 36) > 0.1);
+	CHECK(busy_rect_score(a, 10, 10, 130, 70) ==
+	      busy_rect_score(b, 10, 10, 130, 70));
+
+	busy_destroy(a);
+	busy_destroy(b);
+	img_free(&im);
+}
+
+static void test_bgimage_fill_and_small(void)
+{
+	/* Flat coloured panel along the right edge (FILL) and a small photo
+	 * in the middle (inline figure): neither is a background image. */
+	struct image im = img_new(320, 180, 320 * 4);
+	img_fill(&im, 0, 0, im.w, im.h, 255);
+	img_fill_rgb(&im, 200, 0, 320, 180, 40, 90, 160);
+	img_photo(&im, 70, 70, 110, 100);
+
+	struct busy_analyzer *b = busy_create(im.w, im.h);
+	struct busy_params p = bgimage_params();
+	busy_process(b, im.px, im.linesize, BUSY_FMT_RGBA, &p);
+
+	CHECK(!b->has_image);
+	CHECK(busy_rect_image_frac(b, 0, 0, im.w, im.h) == 0.0);
+	/* The panel's flat interior counts as content (ANY misses it). */
+	CHECK(busy_rect_score(b, 240, 60, 40, 40) == 1.0);
+	CHECK(busy_rect_score(b, 75, 75, 30, 20) == 1.0);
+	/* Background stays free, right up to the panel. */
+	CHECK(busy_rect_score(b, 120, 0, 76, 180) == 0.0);
+
+	struct busy_analyzer *a = busy_create(im.w, im.h);
+	struct busy_params q = defaults();
+	busy_process(a, im.px, im.linesize, BUSY_FMT_RGBA, &q);
+	CHECK(busy_rect_score(a, 240, 60, 40, 40) == 0.0);
+
+	busy_destroy(a);
+	busy_destroy(b);
+	img_free(&im);
+}
+
+static void test_bgimage_motion(void)
+{
+	/* A "video" filling the right half changes between captures: not an
+	 * image to sit on. */
+	struct image f1 = img_new(320, 180, 320 * 4);
+	struct image f2 = img_new(320, 180, 320 * 4);
+	img_fill(&f1, 0, 0, f1.w, f1.h, 255);
+	img_fill(&f2, 0, 0, f2.w, f2.h, 255);
+	img_photo(&f1, 160, 0, 320, 180);
+	for (uint32_t y = 0; y < 180; y++)
+		for (uint32_t x = 160; x < 320; x++) {
+			const uint8_t *s = f1.px + (size_t)y * f1.linesize + 4 * x;
+			img_set(&f2, x, y, (uint8_t)(255 - s[0]),
+				(uint8_t)(255 - s[1]), (uint8_t)(255 - s[2]));
+		}
+
+	struct busy_analyzer *b = busy_create(320, 180);
+	struct busy_params p = bgimage_params();
+	busy_process(b, f1.px, f1.linesize, BUSY_FMT_RGBA, &p);
+	CHECK(b->has_image); /* first capture: no motion information yet */
+	busy_process(b, f2.px, f2.linesize, BUSY_FMT_RGBA, &p);
+	CHECK(!b->has_image);
+	CHECK(busy_rect_score(b, 250, 130, 64, 36) > 0.9);
+
+	/* Static again: an image once more. */
+	busy_process(b, f2.px, f2.linesize, BUSY_FMT_RGBA, &p);
+	CHECK(b->has_image);
+	CHECK(busy_rect_score(b, 250, 130, 64, 36) == 0.0);
+
+	busy_destroy(b);
+	img_free(&f1);
+	img_free(&f2);
+}
+
+static void test_bgimage_no_dominant_bg(void)
+{
+	/* Full-bleed photo: no dominant colour, scored exactly like ANY. */
+	struct image im = img_new(320, 180, 320 * 4);
+	img_photo(&im, 0, 0, 320, 180);
+	struct busy_analyzer *a = busy_create(im.w, im.h);
+	struct busy_analyzer *b = busy_create(im.w, im.h);
+	struct busy_params q = defaults();
+	struct busy_params p = bgimage_params();
+	busy_process(a, im.px, im.linesize, BUSY_FMT_RGBA, &q);
+	busy_process(b, im.px, im.linesize, BUSY_FMT_RGBA, &p);
+	CHECK(!b->has_image);
+	CHECK(memcmp(a->cost, b->cost, (size_t)im.w * im.h) == 0);
+
+	/* Other resolutions and BGRA work too. */
+	for (uint32_t w = 160; w <= 480; w += 160) {
+		uint32_t h = w * 9 / 16;
+		struct image s = img_new(w, h, w * 4);
+		img_fill(&s, 0, 0, w, h, 255);
+		img_photo(&s, 0, 0, w / 2, h);
+		struct busy_analyzer *c = busy_create(w, h);
+		busy_process(c, s.px, s.linesize, BUSY_FMT_BGRA, &p);
+		CHECK(c->has_image);
+		CHECK(busy_rect_image_frac(c, 0, h / 2.0, w / 5.0, h / 5.0) ==
+		      1.0);
+		CHECK(busy_rect_image_frac(c, w * 0.6, 0, w * 0.4, h) == 0.0);
+		busy_destroy(c);
+		img_free(&s);
+	}
+
+	busy_destroy(a);
+	busy_destroy(b);
+	img_free(&im);
+}
+
 int main(void)
 {
 	test_params_and_create();
@@ -496,6 +737,12 @@ int main(void)
 	test_bgra_equivalence();
 	test_linesize_padding();
 	test_sensitivity();
+	test_registry();
+	test_cost_map();
+	test_bgimage_side_photo();
+	test_bgimage_fill_and_small();
+	test_bgimage_motion();
+	test_bgimage_no_dominant_bg();
 
 	if (failures) {
 		fprintf(stderr, "test_busy: %d of %d checks FAILED\n", failures,

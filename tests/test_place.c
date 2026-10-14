@@ -3,7 +3,8 @@
  *
  * Uses a fake score function over a synthetic busy map in canvas space:
  * either a list of busy rectangles, or (inverted) a fully busy canvas with
- * clear "holes". Score = busy fraction of the (inflated) rect.
+ * clear "holes". Score = busy fraction of the (inflated) rect. Optional
+ * "photo" rects make up the image map (image fraction of the camera rect).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -53,6 +54,8 @@ struct busy_map {
 	struct rect r[16];
 	int n;
 	bool inverted; /* whole canvas busy except r[] (disjoint holes) */
+	struct rect img[4]; /* disjoint background-image rects */
+	int n_img;
 };
 
 static double overlap(double x, double y, double w, double h,
@@ -81,6 +84,24 @@ static double fake_score(void *ctx, double x, double y, double w, double h)
 	}
 	busy /= area;
 	return busy < 0.0 ? 0.0 : (busy > 1.0 ? 1.0 : busy);
+}
+
+static double fake_image(void *ctx, double x, double y, double w, double h)
+{
+	const struct busy_map *m = ctx;
+	double area = w * h, cov = 0.0;
+	if (area <= 0.0)
+		return 0.0;
+	for (int i = 0; i < m->n_img; i++)
+		cov += overlap(x, y, w, h, &m->img[i]);
+	return cov / area;
+}
+
+/* Photo filling the left or right half of the canvas. */
+static void map_photo(struct busy_map *m, bool right)
+{
+	m->img[m->n_img++] = (struct rect){right ? CANVAS_W / 2 : 0, 0,
+					   CANVAS_W / 2, CANVAS_H};
 }
 
 static void map_add(struct busy_map *m, double x, double y, double w, double h)
@@ -117,7 +138,7 @@ static void sim_init(struct sim *s, double x, double y)
 
 /* Run one check at time t (seconds, offset so t=0 is not ns 0) and apply
  * the decision to the simulated camera. */
-static enum place_action sim_step(struct sim *s, double t)
+static enum place_action sim_step_nc(struct sim *s, double t, bool new_content)
 {
 	struct place_input in = {
 		.now_ns = 100 * SEC + (uint64_t)(t * (double)SEC),
@@ -130,6 +151,8 @@ static enum place_action sim_step(struct sim *s, double t)
 		.cam_visible = s->visible,
 		.score = fake_score,
 		.score_ctx = &s->map,
+		.image_frac = fake_image,
+		.new_content = new_content,
 	};
 	s->last = place_evaluate(&s->st, &s->cfg, &in);
 	switch (s->last.action) {
@@ -149,6 +172,32 @@ static enum place_action sim_step(struct sim *s, double t)
 		break;
 	}
 	return s->last.action;
+}
+
+static enum place_action sim_step(struct sim *s, double t)
+{
+	return sim_step_nc(s, t, false);
+}
+
+/* Simulated slide with a text column beside the photo (or none). */
+static void sim_slide(struct sim *s, int photo /* 0 none, 1 left, 2 right */)
+{
+	s->map.n = 0;
+	s->map.n_img = 0;
+	s->map.inverted = false;
+	if (photo)
+		map_photo(&s->map, photo == 2);
+	/* text near the top of the other column */
+	map_add(&s->map, photo == 1 ? 1000 : 60, 80, 800, 500);
+}
+
+static void sim_init_images(struct sim *s, double x, double y)
+{
+	sim_init(s, x, y);
+	s->cfg.prefer_images = true;
+	s->cfg.choices[0] = PLACE_ANCHOR_BOTTOM_RIGHT;
+	s->cfg.choices[1] = PLACE_ANCHOR_BOTTOM_LEFT;
+	s->cfg.choices[2] = PLACE_ANCHOR_NONE;
 }
 
 static bool at(const struct sim *s, double x, double y)
@@ -227,6 +276,8 @@ static void test_defaults(void)
 	CHECK(c.cooldown_ns == 1 * SEC);
 	CHECK_NEAR(c.lambda, 0.01);
 	CHECK(c.grid_divisions == 48);
+	CHECK(!c.prefer_images);
+	CHECK_NEAR(c.t_image, 0.9);
 }
 
 static void test_stays_put(void)
@@ -580,6 +631,189 @@ static void test_ease(void)
 	CHECK(mono);
 }
 
+static void test_images(void)
+{
+	struct sim s;
+
+	/* Image on the right: from BL to BR on new content. */
+	sim_init_images(&s, LEFT_X, BOTTOM_Y);
+	sim_slide(&s, 2);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+	CHECK(s.last.chosen >= 0);
+	CHECK(s.last.report[s.last.chosen].on_image);
+	CHECK_NEAR(s.last.report[s.last.chosen].image_frac, 1.0);
+	CHECK(sim_step(&s, 5) == PLACE_ACTION_NONE);
+
+	/* Image on the left with BR (empty, suitable) as 1st choice: BL. */
+	sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+	/* ... and it stays there: return home doesn't pull it off the image
+	 * onto the empty (non-image) 1st choice. */
+	for (int i = 1; i < 12; i++)
+		CHECK(sim_step(&s, i) == PLACE_ACTION_NONE);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+	/* Repeated new_content on the same slide: already well placed. */
+	CHECK(sim_step_nc(&s, 12, true) == PLACE_ACTION_NONE);
+
+	/* Next slide has its image on the right: re-rank moves to BR. */
+	sim_slide(&s, 2);
+	CHECK(sim_step_nc(&s, 13, true) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+	/* Then a slide without an image: BR is clear, so it stays put. */
+	sim_slide(&s, 0);
+	CHECK(sim_step_nc(&s, 14, true) == PLACE_ACTION_NONE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+
+	/* Without an image the behaviour is unchanged: stay put at BL while
+	 * clear, then return home to BR after the delay. */
+	sim_init_images(&s, LEFT_X, BOTTOM_Y);
+	sim_slide(&s, 0);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_NONE);
+	CHECK(sim_step(&s, 2) == PLACE_ACTION_NONE);
+	CHECK(sim_step(&s, 3) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+
+	/* prefer_images off: images are ignored, BR stays. */
+	sim_init(&s, RIGHT_X, BOTTOM_Y);
+	s.cfg.choices[1] = PLACE_ANCHOR_BOTTOM_LEFT;
+	s.cfg.choices[2] = PLACE_ANCHOR_NONE;
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_NONE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+	CHECK(!s.last.report[0].on_image);
+
+	/* Image-suitable needs suitable: content on the photo's corner (the
+	 * caption of an image, say) keeps the camera off it. */
+	sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+	sim_slide(&s, 1);
+	map_busy_at(&s.map, LEFT_X, BOTTOM_Y);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_NONE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+
+	/* Image coverage below t_image is not enough. */
+	sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+	s.map.img[s.map.n_img++] = (struct rect){0, 0, LEFT_X + CAM_W * 0.8,
+						 CANVAS_H};
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_NONE);
+	s.cfg.t_image = 0.75;
+	CHECK(sim_step_nc(&s, 1, true) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+}
+
+static void test_images_cooldown(void)
+{
+	struct sim s;
+
+	/* Re-rank during the cooldown waits and stays pending without
+	 * further new_content. */
+	sim_init_images(&s, LEFT_X, BOTTOM_Y);
+	sim_slide(&s, 2);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_MOVE); /* -> BR */
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0.4, true) == PLACE_ACTION_NONE); /* cooling */
+	CHECK(sim_step(&s, 0.7) == PLACE_ACTION_NONE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+	CHECK(sim_step(&s, 1.0) == PLACE_ACTION_MOVE); /* sticky request */
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+	CHECK(sim_step(&s, 2.5) == PLACE_ACTION_NONE);
+
+	/* Superseded: the next new_content (no image) drops the request. */
+	sim_init_images(&s, LEFT_X, BOTTOM_Y);
+	sim_slide(&s, 2);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_MOVE); /* -> BR */
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0.4, true) == PLACE_ACTION_NONE);
+	sim_slide(&s, 0);
+	CHECK(sim_step_nc(&s, 0.8, true) == PLACE_ACTION_NONE);
+	CHECK(sim_step(&s, 1.2) == PLACE_ACTION_NONE);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+
+	/* Confirm checks don't delay the re-rank. */
+	sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+	s.cfg.confirm_checks = 3;
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+}
+
+static void test_images_hidden(void)
+{
+	struct sim s;
+
+	/* Hidden camera shows straight onto the image (no confirm checks). */
+	sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+	s.cfg.confirm_checks = 3;
+	s.visible = false;
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_SHOW);
+	CHECK(s.visible);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+
+	/* Hidden, no image: the usual confirm checks apply, and the shown
+	 * position is the 1st suitable choice. */
+	sim_init_images(&s, LEFT_X, BOTTOM_Y);
+	s.cfg.confirm_checks = 2;
+	s.visible = false;
+	sim_slide(&s, 0);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_NONE);
+	CHECK(sim_step(&s, 1) == PLACE_ACTION_SHOW);
+	CHECK(at(&s, RIGHT_X, BOTTOM_Y));
+
+	/* Hidden without new_content: shows at the image-suitable choice
+	 * once confirmed, ahead of a higher-priority empty choice. */
+	sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+	s.visible = false;
+	sim_slide(&s, 1);
+	CHECK(sim_step(&s, 0) == PLACE_ACTION_SHOW);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+
+	/* Current spot turns busy: the move prefers the image choice. */
+	sim_init_images(&s, LEFT_X, TOP_Y);
+	s.cfg.choices[0] = PLACE_ANCHOR_TOP_LEFT;
+	s.cfg.choices[1] = PLACE_ANCHOR_BOTTOM_RIGHT;
+	s.cfg.choices[2] = PLACE_ANCHOR_BOTTOM_LEFT;
+	map_photo(&s.map, false);
+	map_busy_at(&s.map, LEFT_X, TOP_Y);
+	CHECK(sim_step(&s, 0) == PLACE_ACTION_MOVE);
+	CHECK(at(&s, LEFT_X, BOTTOM_Y));
+}
+
+static void test_images_anywhere(void)
+{
+	struct sim s;
+
+	/* ANYWHERE: the re-rank searches the grid for an image-suitable
+	 * spot; the auto search prefers one too. */
+	sim_init_images(&s, RIGHT_X, TOP_Y);
+	s.cfg.mode = PLACE_MODE_ANYWHERE;
+	sim_slide(&s, 1);
+	CHECK(sim_step_nc(&s, 0, true) == PLACE_ACTION_MOVE);
+	CHECK(s.x + CAM_W <= CANVAS_W / 2 + 1e-6);
+	CHECK(within_margins(s.x, s.y));
+	CHECK(s.last.report[s.last.chosen].on_image);
+	CHECK(sim_step_nc(&s, 3, true) == PLACE_ACTION_NONE); /* stays */
+
+	/* Preferred-then-anywhere, choices all busy: auto search lands on
+	 * the photo rather than the nearest empty spot. */
+	for (int pref = 0; pref < 2; pref++) {
+		sim_init_images(&s, RIGHT_X, BOTTOM_Y);
+		s.cfg.prefer_images = pref;
+		s.cfg.choices[1] = PLACE_ANCHOR_TOP_RIGHT;
+		s.map.inverted = true;
+		map_add(&s.map, 1000, 300, 600, 500); /* empty hole, near */
+		map_add(&s.map, 0, 0, 900, CANVAS_H); /* empty hole = photo */
+		s.map.img[s.map.n_img++] = (struct rect){0, 0, 900, CANVAS_H};
+		CHECK(sim_step(&s, 0) == PLACE_ACTION_MOVE);
+		if (pref)
+			CHECK(s.x + CAM_W <= 900);
+		else
+			CHECK(s.x >= 1000);
+	}
+}
+
 int main(void)
 {
 	test_anchors();
@@ -594,6 +828,10 @@ int main(void)
 	test_anywhere();
 	test_margins();
 	test_ease();
+	test_images();
+	test_images_cooldown();
+	test_images_hidden();
+	test_images_anywhere();
 
 	if (failures) {
 		fprintf(stderr, "test_place: %d of %d checks FAILED\n",

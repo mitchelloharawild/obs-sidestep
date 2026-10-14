@@ -16,7 +16,18 @@ include(defaults)
 include(helpers)
 
 # Core: image analysis and placement, no libobs.
-add_library(sidestep-core STATIC src/core/busy.c src/core/place.c)
+add_library(
+  sidestep-core
+  STATIC
+  src/core/busy.c
+  src/core/place.c
+  src/core/strategy.c
+  src/core/strat_any.c
+  src/core/strat_bgimage.c
+  src/core/strat_solid.c
+  src/core/strat_activity.c
+  src/core/mod_template.c
+)
 target_include_directories(sidestep-core PUBLIC src/core)
 set_target_properties(sidestep-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
@@ -41,11 +52,15 @@ endif()
 
 if(SIDESTEP_BUILD_TESTS)
   enable_testing()
-  foreach(t test_busy test_place)
+  foreach(t test_busy test_place test_mod_template test_strat_activity test_strat_solid)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sidestep-core)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
-  add_executable(bench_busy tests/bench_busy.c)
-  target_link_libraries(bench_busy PRIVATE sidestep-core)
+  # Not tests: a benchmark and the fixture evaluation used for tuning
+  # (run from the source dir: eval_fixtures tests/fixtures/user2026).
+  foreach(t bench_busy eval_fixtures)
+    add_executable(${t} tests/${t}.c)
+    target_link_libraries(${t} PRIVATE sidestep-core)
+  endforeach()
 endif()

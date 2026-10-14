@@ -19,6 +19,11 @@
  *    hidden by the user (hotkey) is not forced visible.
  *  - When idle, `chosen` points at the current position if it is visible
  *    and suitable; it is -1 when hiding or hidden with nothing selected.
+ *  - Image preference: the re-rank considers the choices only (ANYWHERE:
+ *    the grid), never an automatic spot in preferred-then-anywhere mode,
+ *    so the user's choice list still bounds where the camera goes. In
+ *    every selection, image-suitable beats merely suitable within the
+ *    same tier (choices, then grid).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -46,6 +51,8 @@ void place_config_default(struct place_config *c)
 	c->cooldown_ns = 1000000000ULL;
 	c->lambda = 0.01;
 	c->grid_divisions = 48;
+	c->prefer_images = false;
+	c->t_image = 0.9;
 }
 
 void place_state_reset(struct place_state *s)
@@ -112,6 +119,8 @@ struct cand {
 	double x, y;
 	double score;
 	bool suitable;
+	double img;    /* image fraction of the camera rect */
+	bool on_image; /* image-suitable */
 };
 
 struct ctx {
@@ -119,6 +128,7 @@ struct ctx {
 	const struct place_input *in;
 	struct place_decision *d;
 	double diag;
+	bool images; /* prefer_images with image information */
 };
 
 static bool same_pos(double ax, double ay, double bx, double by)
@@ -135,6 +145,13 @@ static void score_at(struct ctx *k, double x, double y, struct cand *out)
 	out->score = in->score(in->score_ctx, x - m, y - m, in->cam_w + 2.0 * m,
 			       in->cam_h + 2.0 * m);
 	out->suitable = out->score <= k->c->t_suitable;
+	out->img = 0.0;
+	out->on_image = false;
+	if (k->images) {
+		void *ictx = in->image_ctx ? in->image_ctx : in->score_ctx;
+		out->img = in->image_frac(ictx, x, y, in->cam_w, in->cam_h);
+		out->on_image = out->suitable && out->img >= k->c->t_image;
+	}
 }
 
 /* Add a rect to the report (deduplicated by position); returns its index
@@ -155,6 +172,8 @@ static int report_add(struct ctx *k, const struct cand *cd)
 	r->h = k->in->cam_h;
 	r->score = cd->score;
 	r->suitable = cd->suitable;
+	r->image_frac = cd->img;
+	r->on_image = cd->on_image;
 	return d->n_report++;
 }
 
@@ -192,8 +211,10 @@ static int grid_axis(double canvas, double size, double margin, double stride,
 }
 
 /* Automatic search. Minimises cost among suitable rects (or among all
- * rects when any_score is set, for the least-busy fallback). */
-static bool grid_search(struct ctx *k, bool any_score, struct cand *best)
+ * rects when any_score is set, for the least-busy fallback; only among
+ * image-suitable rects when need_image is set). */
+static bool grid_search(struct ctx *k, bool any_score, bool need_image,
+			struct cand *best)
 {
 	const struct place_input *in = k->in;
 	double m = k->c->margin;
@@ -213,6 +234,8 @@ static bool grid_search(struct ctx *k, bool any_score, struct cand *best)
 			struct cand cd;
 			score_at(k, x, y, &cd);
 			if (!any_score && !cd.suitable)
+				continue;
+			if (need_image && !cd.on_image)
 				continue;
 			double cc = cost(k, &cd);
 			if (!found || cc < best_cost) {
@@ -241,7 +264,7 @@ struct place_decision place_evaluate(struct place_state *s,
 		s->initialised = true;
 	}
 
-	struct ctx k = {c, in, &d, 0.0};
+	struct ctx k = {c, in, &d, 0.0, c->prefer_images && in->image_frac};
 	k.diag = sqrt(in->canvas_w * in->canvas_w + in->canvas_h * in->canvas_h);
 	if (k.diag <= 0.0)
 		k.diag = 1.0;
@@ -251,6 +274,11 @@ struct place_decision place_evaluate(struct place_state *s,
 	bool use_auto = c->mode != PLACE_MODE_PREFERRED;
 	int confirm = c->confirm_checks < 1 ? 1 : c->confirm_checks;
 	bool cooling = s->has_acted && now - s->last_action_ns < c->cooldown_ns;
+
+	if (!k.images)
+		s->rerank_pending = false;
+	else if (in->new_content)
+		s->rerank_pending = true; /* supersedes an older request */
 
 	/* Score the choices and track their continuous suitability. */
 	struct cand ch[PLACE_MAX_CHOICES];
@@ -283,11 +311,29 @@ struct place_decision place_evaluate(struct place_state *s,
 		} else {
 			s->suitable_since_ns[i] = 0;
 		}
+		if (ch_valid[i] && ch[i].on_image) {
+			if (!s->image_since_ns[i])
+				s->image_since_ns[i] = now ? now : 1;
+		} else {
+			s->image_since_ns[i] = 0;
+		}
 	}
 
-	/* Selection: highest-priority suitable choice, else auto search. */
+	/* Highest-priority image-suitable choice (prefer_images only). */
+	int img_prio = PLACE_MAX_CHOICES;
+	for (int i = 0; i < PLACE_MAX_CHOICES && k.images; i++) {
+		if (ch_valid[i] && ch[i].on_image) {
+			img_prio = i;
+			break;
+		}
+	}
+
+	/* Selection: highest-priority image-suitable choice, else
+	 * highest-priority suitable choice, else auto search. */
 	struct cand sel = {0};
-	bool has_sel = false;
+	bool has_sel = img_prio < PLACE_MAX_CHOICES;
+	if (has_sel)
+		sel = ch[img_prio];
 	for (int i = 0; i < PLACE_MAX_CHOICES && !has_sel; i++) {
 		if (ch_valid[i] && ch[i].suitable) {
 			sel = ch[i];
@@ -305,11 +351,43 @@ struct place_decision place_evaluate(struct place_state *s,
 	} else {
 		need_sel = true;
 	}
-	if (!has_sel && use_auto && need_sel)
-		has_sel = grid_search(&k, false, &sel);
+	if (!has_sel && use_auto && need_sel) {
+		if (k.images)
+			has_sel = grid_search(&k, false, true, &sel);
+		if (!has_sel)
+			has_sel = grid_search(&k, false, false, &sel);
+	}
 
 	bool act = false;
-	if (!in->cam_visible) {
+
+	/* Image re-rank after new content: no confirm checks, but it waits
+	 * out the cooldown (the request stays pending). */
+	if (s->rerank_pending) {
+		struct cand target = {0};
+		int tprio = img_prio;
+		bool found = tprio < PLACE_MAX_CHOICES;
+		if (found)
+			target = ch[tprio];
+		else if (!use_choices)
+			found = grid_search(&k, false, true, &target);
+
+		if (!found) {
+			s->rerank_pending = false; /* normal rules apply */
+		} else if (in->cam_visible && cur.on_image && cur_prio <= tprio) {
+			s->rerank_pending = false; /* already well placed */
+		} else if (!cooling) {
+			d.action = in->cam_visible ? PLACE_ACTION_MOVE : PLACE_ACTION_SHOW;
+			d.x = target.x;
+			d.y = target.y;
+			d.chosen = report_add(&k, &target);
+			s->rerank_pending = false;
+			act = true;
+		}
+	}
+
+	if (act) {
+		/* re-ranked; skip the regular rules this check */
+	} else if (!in->cam_visible) {
 		s->unsuitable_count = 0;
 		s->show_count = has_sel ? s->show_count + 1 : 0;
 		if (has_sel) {
@@ -325,9 +403,13 @@ struct place_decision place_evaluate(struct place_state *s,
 		s->show_count = 0;
 		s->unsuitable_count = 0;
 		/* Return home to the highest choice above the current one that
-		 * has been suitable for the return delay. */
+		 * has been suitable for the return delay. On an image, only
+		 * image-suitable choices pull the camera away. */
+		const uint64_t *since_ns = k.images && cur.on_image
+						   ? s->image_since_ns
+						   : s->suitable_since_ns;
 		for (int i = 0; i < cur_prio && c->return_home; i++) {
-			uint64_t since = s->suitable_since_ns[i];
+			uint64_t since = since_ns[i];
 			if (!since || now < since ||
 			    now - since < c->return_delay_ns)
 				continue;
@@ -356,7 +438,7 @@ struct place_decision place_evaluate(struct place_state *s,
 				}
 			} else if (use_auto) {
 				/* Least busy over grid + choices. */
-				move = grid_search(&k, true, &target);
+				move = grid_search(&k, true, false, &target);
 				for (int i = 0; i < PLACE_MAX_CHOICES; i++) {
 					if (ch_valid[i] &&
 					    (!move || cost(&k, &ch[i]) <

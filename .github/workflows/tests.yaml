@@ -22,10 +22,11 @@ jobs:
 
       # The core has no libobs dependency, so build it directly rather than
       # through the plugin's CMake bootstrap (which fetches OBS sources).
+      # All of src/core/*.c, so new strategy files are picked up.
       - name: Build and run tests
         run: |
-          for t in test_busy test_place; do
+          for t in test_busy test_place test_mod_template test_strat_activity test_strat_solid; do
             gcc -std=c11 -O2 -Wall -Wextra -Isrc/core \
-              src/core/busy.c src/core/place.c tests/$t.c -lm -o $t
+              src/core/*.c tests/$t.c -lm -o $t
             ./$t
           done

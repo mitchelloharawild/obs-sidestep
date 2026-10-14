@@ -1,0 +1,17 @@
+# fixture      expected image side (left / right / none)
+slide00.ppm    none
+slide01.ppm    none
+slide04.ppm    right
+slide07.ppm    right
+slide11.ppm    right
+slide15.ppm    right
+slide22.ppm    right
+slide23.ppm    none
+slide26.ppm    none
+slide30.ppm    left
+slide32.ppm    left
+slide36.ppm    left
+slide39.ppm    left
+slide43.ppm    none
+slide46.ppm    right
+slide53.ppm    left

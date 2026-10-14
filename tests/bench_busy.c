@@ -2,11 +2,12 @@
  * obs-sidestep — benchmark for core/busy.c
  *
  * Times one "check" (busy_process + ~3000 busy_rect_score lookups) at each
- * analysis resolution.
+ * analysis resolution, for every registered avoidance strategy.
  *
  * SPDX-License-Identifier: MIT
  */
 #include "busy.h"
+#include "strategy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +32,8 @@ static uint32_t rng(void)
 /* Keeps the compiler from discarding the scores. */
 static volatile double sink;
 
-static void bench(uint32_t w, uint32_t h, int iters)
+static void bench(uint32_t w, uint32_t h, int iters,
+		  const struct busy_strategy_ops *ops)
 {
 	const uint32_t linesize = w * 4;
 	const int nframes = 2;
@@ -43,7 +45,9 @@ static void bench(uint32_t w, uint32_t h, int iters)
 			exit(1);
 		}
 		/* Slide-like content: white page, text in the top half,
-		 * noisy photo in the bottom right, differs between frames. */
+		 * noisy photo in the bottom right, differs between frames.
+		 * The photo touches the border, so "Background images"
+		 * runs its full region analysis. */
 		for (uint32_t y = 0; y < h; y++) {
 			uint8_t *row = frames[f] + (size_t)y * linesize;
 			for (uint32_t x = 0; x < w; x++) {
@@ -77,6 +81,7 @@ static void bench(uint32_t w, uint32_t h, int iters)
 	struct busy_analyzer *b = busy_create(w, h);
 	struct busy_params p;
 	busy_params_default(&p);
+	p.strategy = ops->id;
 
 	/* Warm-up. */
 	for (int i = 0; i < 10; i++)
@@ -97,10 +102,10 @@ static void bench(uint32_t w, uint32_t h, int iters)
 	}
 	sink = acc;
 
-	printf("%4ux%-4u  process %8.1f us   %d rects %7.1f us   "
+	printf("%-22s %4ux%-4u  process %8.1f us   %d rects %7.1f us   "
 	       "total %8.1f us/check\n",
-	       w, h, t_proc / iters, RECTS_PER_CHECK, t_rect / iters,
-	       (t_proc + t_rect) / iters);
+	       ops->name_key, w, h, t_proc / iters, RECTS_PER_CHECK,
+	       t_rect / iters, (t_proc + t_rect) / iters);
 
 	busy_destroy(b);
 	free(rects);
@@ -115,8 +120,11 @@ int main(int argc, char **argv)
 		iters = 1;
 
 	printf("bench_busy: %d iterations per resolution\n", iters);
-	bench(160, 90, iters);
-	bench(320, 180, iters);
-	bench(480, 270, iters);
+	for (size_t i = 0; i < busy_strategy_count(); i++) {
+		const struct busy_strategy_ops *ops = busy_strategy_get(i);
+		bench(160, 90, iters, ops);
+		bench(320, 180, iters, ops);
+		bench(480, 270, iters, ops);
+	}
 	return 0;
 }
