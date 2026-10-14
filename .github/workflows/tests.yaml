@@ -1,0 +1,31 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  core-tests:
+    name: Core tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # The core has no libobs dependency, so build it directly rather than
+      # through the plugin's CMake bootstrap (which fetches OBS sources).
+      - name: Build and run tests
+        run: |
+          for t in test_busy test_place; do
+            gcc -std=c11 -O2 -Wall -Wextra -Isrc/core \
+              src/core/busy.c src/core/place.c tests/$t.c -lm -o $t
+            ./$t
+          done

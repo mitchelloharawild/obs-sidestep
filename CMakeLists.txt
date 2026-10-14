@@ -1,18 +1,19 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.28...3.30)
 
-project(obs-sidestep VERSION 0.2.0 LANGUAGES C)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
+
+project(${_name} VERSION ${_version})
 
 option(SIDESTEP_BUILD_PLUGIN "Build the OBS plugin (needs libobs)" ON)
 option(SIDESTEP_BUILD_TESTS "Build unit tests for the core library" ON)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "OBS Studio filter that moves your camera out of the way of on-screen content")
+set(CPACK_DEBIAN_PACKAGE_SECTION "video")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/mitchelloharawild/obs-sidestep")
 
-if(MSVC)
-  add_compile_options(/W4)
-else()
-  add_compile_options(-Wall -Wextra -Wno-unused-parameter)
-endif()
+include(compilerconfig)
+include(defaults)
+include(helpers)
 
 # Core: image analysis and placement, no libobs.
 add_library(sidestep-core STATIC src/core/busy.c src/core/place.c)
@@ -23,28 +24,19 @@ if(NOT MSVC)
 endif()
 
 if(SIDESTEP_BUILD_PLUGIN)
+  add_library(${CMAKE_PROJECT_NAME} MODULE)
+
   find_package(libobs REQUIRED)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sidestep-core OBS::libobs)
 
-  add_library(obs-sidestep MODULE
-    src/plugin-main.c
-    src/sidestep-filter.c
-    src/sidestep-capture.c
-    src/sidestep-overlay.c)
-  target_link_libraries(obs-sidestep PRIVATE sidestep-core OBS::libobs)
-  set_target_properties(obs-sidestep PROPERTIES PREFIX "")
-  target_compile_definitions(obs-sidestep PRIVATE
-    PLUGIN_VERSION="${PROJECT_VERSION}")
+  target_sources(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE src/plugin-main.c src/sidestep-filter.c src/sidestep-capture.c src/sidestep-overlay.c
+  )
 
-  include(GNUInstallDirs)
-  if(UNIX AND NOT APPLE)
-    install(TARGETS obs-sidestep
-      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/obs-plugins)
-    install(DIRECTORY data/
-      DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins/obs-sidestep)
-  else()
-    install(TARGETS obs-sidestep LIBRARY DESTINATION obs-plugins/64bit)
-    install(DIRECTORY data/ DESTINATION data/obs-plugins/obs-sidestep)
-  endif()
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE PLUGIN_VERSION="${PROJECT_VERSION}")
+
+  set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 endif()
 
 if(SIDESTEP_BUILD_TESTS)
