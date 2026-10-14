@@ -157,7 +157,7 @@ bool place_anchor_pos(enum place_anchor a, const struct place_config *c,
 
 /*
  * Run one settled check. Call only when content is settled (the caller
- * implements the transition guard). Rules (see design spec "Selection"):
+ * implements the transition guard). Rules:
  *  - Stay put while the current position is suitable.
  *  - Current unsuitable for confirm_checks consecutive checks: move to
  *    the highest-priority suitable choice (preferred modes); else, in auto

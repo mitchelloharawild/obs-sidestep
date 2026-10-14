@@ -6,8 +6,7 @@ finds where the content is, and moves the camera to a clear spot — your
 preferred corners first, or anywhere that's least busy — hiding it when
 nowhere is clear.
 
-**Status:** early development (v0.2 feature set). See
-[`_dev/design-spec.md`](_dev/design-spec.md).
+**Status:** early development (v0.2 feature set).
 
 ## Usage
 
