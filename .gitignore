@@ -1,5 +1,6 @@
 build/
 build-*/
+!.github/actions/build-plugin/
 .cache/
 compile_commands.json
 build_*/
