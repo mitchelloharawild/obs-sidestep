@@ -8,7 +8,7 @@
  * All geometry is in canvas pixels. A "position" is the top-left corner of
  * the camera's bounding box. Time is in nanoseconds (os_gettime_ns()).
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #pragma once
 

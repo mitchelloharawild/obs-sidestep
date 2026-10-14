@@ -4,7 +4,7 @@
  * Times one "check" (busy_process + ~3000 busy_rect_score lookups) at each
  * analysis resolution.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "busy.h"
 

@@ -20,7 +20,7 @@
  *  - When idle, `chosen` points at the current position if it is visible
  *    and suitable; it is -1 when hiding or hidden with nothing selected.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "place.h"
 

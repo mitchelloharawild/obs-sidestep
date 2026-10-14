@@ -5,7 +5,7 @@
  * draws them over the filter output. Setters may be called from any
  * thread; render only from the graphics thread.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #pragma once
 

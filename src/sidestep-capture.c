@@ -12,7 +12,7 @@
  * a later frame (never the frame it was staged), so the CPU never waits on
  * the GPU.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "sidestep-capture.h"
 

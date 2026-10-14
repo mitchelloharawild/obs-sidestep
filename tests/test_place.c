@@ -5,7 +5,7 @@
  * either a list of busy rectangles, or (inverted) a fully busy canvas with
  * clear "holes". Score = busy fraction of the (inflated) rect.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "place.h"
 

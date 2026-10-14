@@ -1,7 +1,7 @@
 /*
  * obs-sidestep — busyness analysis (no libobs dependency).
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "busy.h"
 

@@ -2,7 +2,7 @@
  * obs-sidestep — debug overlay: busy mask tint, candidate outlines and a
  * tiny built-in 3x5 bitmap font for score labels / status text.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "sidestep-overlay.h"
 

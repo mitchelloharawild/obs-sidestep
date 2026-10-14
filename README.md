@@ -35,4 +35,4 @@ build and test it alone with `-DSIDESTEP_BUILD_PLUGIN=OFF`.
 
 ## Licence
 
-GPL-2.0-or-later (required for plugins linking libobs). See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).

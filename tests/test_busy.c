@@ -1,7 +1,7 @@
 /*
  * obs-sidestep — unit tests for core/busy.c
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include "busy.h"
 

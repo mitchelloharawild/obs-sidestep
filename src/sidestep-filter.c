@@ -12,7 +12,7 @@
  * on whichever thread removes the filter; f->lock serialises tick, update
  * and filter_remove.
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 #include <obs-module.h>
 #include <graphics/matrix4.h>
